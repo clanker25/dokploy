@@ -1,0 +1,205 @@
+import {
+	assertCanUseBindMount,
+	assertCanUseVolumeMount,
+	createMount,
+	deleteMount,
+	findApplicationById,
+	findMountById,
+	findMountsByApplicationId,
+	getServiceContainer,
+	getServiceOrganizationId,
+	readFileMountContent,
+	updateMount,
+} from "@dokploy/server";
+import {
+	checkServiceAccess,
+	checkServicePermissionAndAccess,
+} from "@dokploy/server/services/permission";
+import { TRPCError } from "@trpc/server";
+import { z } from "zod";
+import { audit } from "@/server/api/utils/audit";
+import {
+	apiCreateMount,
+	apiFindMountByApplicationId,
+	apiFindOneMount,
+	apiRemoveMount,
+	apiUpdateMount,
+} from "@/server/db/schema";
+import { createTRPCRouter, protectedProcedure } from "../trpc";
+
+export const mountRouter = createTRPCRouter({
+	create: protectedProcedure
+		.input(apiCreateMount)
+		.mutation(async ({ input, ctx }) => {
+			await checkServicePermissionAndAccess(ctx, input.serviceId, {
+				volume: ["create"],
+			});
+			await assertCanUseBindMount(ctx, input.type, input.hostPath);
+			await assertCanUseVolumeMount(ctx, {
+				serviceId: input.serviceId,
+				serviceType: input.serviceType ?? "application",
+				type: input.type,
+				volumeName: input.volumeName,
+			});
+			const mount = await createMount(input);
+			await audit(ctx, {
+				action: "create",
+				resourceType: "mount",
+				resourceId: mount.mountId,
+				resourceName: input.mountPath,
+			});
+			return mount;
+		}),
+	remove: protectedProcedure
+		.input(apiRemoveMount)
+		.mutation(async ({ input, ctx }) => {
+			const mount = await findMountById(input.mountId);
+			const serviceId =
+				mount.applicationId ||
+				mount.postgresId ||
+				mount.mariadbId ||
+				mount.mongoId ||
+				mount.mysqlId ||
+				mount.redisId ||
+				mount.libsqlId ||
+				mount.composeId;
+			if (serviceId) {
+				await checkServicePermissionAndAccess(ctx, serviceId, {
+					volume: ["delete"],
+				});
+			}
+			await audit(ctx, {
+				action: "delete",
+				resourceType: "mount",
+				resourceId: input.mountId,
+			});
+			return await deleteMount(input.mountId);
+		}),
+
+	one: protectedProcedure
+		.input(apiFindOneMount)
+		.query(async ({ input, ctx }) => {
+			const mount = await findMountById(input.mountId);
+			const serviceId =
+				mount.applicationId ||
+				mount.postgresId ||
+				mount.mariadbId ||
+				mount.mongoId ||
+				mount.mysqlId ||
+				mount.redisId ||
+				mount.libsqlId ||
+				mount.composeId;
+			if (serviceId) {
+				await checkServicePermissionAndAccess(ctx, serviceId, {
+					volume: ["read"],
+				});
+			}
+			return mount;
+		}),
+	readFileContent: protectedProcedure
+		.input(apiFindOneMount)
+		.query(async ({ input, ctx }) => {
+			const mount = await findMountById(input.mountId);
+			const serviceId =
+				mount.applicationId ||
+				mount.postgresId ||
+				mount.mariadbId ||
+				mount.mongoId ||
+				mount.mysqlId ||
+				mount.redisId ||
+				mount.libsqlId ||
+				mount.composeId;
+			if (serviceId) {
+				await checkServicePermissionAndAccess(ctx, serviceId, {
+					volume: ["read"],
+				});
+			}
+			return await readFileMountContent(input.mountId);
+		}),
+	update: protectedProcedure
+		.input(apiUpdateMount)
+		.mutation(async ({ input, ctx }) => {
+			const mount = await findMountById(input.mountId);
+			const serviceId =
+				mount.applicationId ||
+				mount.postgresId ||
+				mount.mariadbId ||
+				mount.mongoId ||
+				mount.mysqlId ||
+				mount.redisId ||
+				mount.libsqlId ||
+				mount.composeId;
+			if (serviceId) {
+				await checkServicePermissionAndAccess(ctx, serviceId, {
+					volume: ["create"],
+				});
+			}
+			await assertCanUseBindMount(
+				ctx,
+				input.type ?? mount.type,
+				input.hostPath ?? mount.hostPath,
+			);
+			if (serviceId) {
+				await assertCanUseVolumeMount(ctx, {
+					serviceId,
+					serviceType: mount.serviceType,
+					type: input.type ?? mount.type,
+					volumeName: input.volumeName ?? mount.volumeName,
+				});
+			}
+			const { expectedContent, ...mountData } = input;
+			if (mount.type === "file" && expectedContent !== undefined) {
+				const currentContent = await readFileMountContent(input.mountId);
+				if (currentContent !== expectedContent) {
+					throw new TRPCError({
+						code: "CONFLICT",
+						message:
+							"The file changed on disk after you opened it. Reopen the editor to load the latest version.",
+					});
+				}
+			}
+			await audit(ctx, {
+				action: "update",
+				resourceType: "mount",
+				resourceId: input.mountId,
+				resourceName: input.mountPath,
+			});
+			return await updateMount(input.mountId, mountData);
+		}),
+	allNamedByApplicationId: protectedProcedure
+		.input(z.object({ applicationId: z.string().min(1) }))
+		.query(async ({ input, ctx }) => {
+			await checkServicePermissionAndAccess(ctx, input.applicationId, {
+				volume: ["read"],
+			});
+			const app = await findApplicationById(input.applicationId);
+			const container = await getServiceContainer(app.appName, app.serverId);
+			const mounts = container?.Mounts.filter(
+				(mount) => mount.Type === "volume" && mount.Source !== "",
+			);
+			return mounts;
+		}),
+	listByServiceId: protectedProcedure
+		.input(apiFindMountByApplicationId)
+		.query(async ({ input, ctx }) => {
+			await checkServiceAccess(ctx, input.serviceId, "read");
+			const organizationId = await getServiceOrganizationId(
+				input.serviceId,
+				input.serviceType,
+			);
+			if (
+				organizationId === null ||
+				organizationId !== ctx.session.activeOrganizationId
+			) {
+				throw new TRPCError({
+					code: "UNAUTHORIZED",
+					message:
+						"You are not authorized to access this service or it does not exist",
+				});
+			}
+			return await findMountsByApplicationId(
+				input.serviceId,
+				input.serviceType,
+			);
+		}),
+});

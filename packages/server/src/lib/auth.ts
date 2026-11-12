@@ -1,0 +1,794 @@
+import type { IncomingMessage } from "node:http";
+import { apiKey } from "@better-auth/api-key";
+import { passkey } from "@better-auth/passkey";
+import { scim } from "@better-auth/scim";
+import { sso } from "@better-auth/sso";
+import * as bcrypt from "bcrypt";
+import { betterAuth } from "better-auth";
+import { drizzleAdapter } from "better-auth/adapters/drizzle";
+import {
+	APIError,
+	createAuthMiddleware,
+	getSessionFromCtx,
+} from "better-auth/api";
+import { admin, organization, twoFactor } from "better-auth/plugins";
+import { and, desc, eq } from "drizzle-orm";
+import { getRootAdminIds, IS_CLOUD } from "../constants";
+import { db } from "../db";
+import * as schema from "../db/schema";
+import {
+	getTrustedOrigins,
+	getTrustedProviders,
+	getUserByToken,
+} from "../services/admin";
+import { createAuditLog } from "../services/proprietary/audit-log";
+import { resolveOrganizationDefaultRole } from "../services/proprietary/license-key";
+import {
+	getWebServerSettings,
+	updateWebServerSettings,
+} from "../services/web-server-settings";
+import { getHubSpotUTK, submitToHubSpot } from "../utils/tracking/hubspot";
+import { captureEvent, getPostHogSessionId } from "../utils/tracking/posthog";
+import {
+	sendEmail,
+	sendVerificationEmail,
+} from "../verification/send-verification-email";
+import { getPublicIpWithFallback } from "../wss/utils";
+import { ac, adminRole, memberRole, ownerRole } from "./access-control";
+import { betterAuthSecret } from "./auth-secret";
+
+const resolveTrustedOrigins = async () => {
+	try {
+		if (IS_CLOUD) {
+			return await getTrustedOrigins();
+		}
+		const [trustedOrigins, settings] = await Promise.all([
+			getTrustedOrigins(),
+			getWebServerSettings(),
+		]);
+
+		if (!settings) return [];
+
+		const devOrigins =
+			process.env.NODE_ENV === "development"
+				? [
+						"http://localhost:3000",
+						"https://absolutely-handy-falcon.ngrok-free.app",
+					]
+				: [];
+		return [
+			...(settings?.serverIp ? [`http://${settings?.serverIp}:3000`] : []),
+			...(settings?.host ? [`https://${settings?.host}`] : []),
+			...devOrigins,
+			...trustedOrigins,
+		];
+	} catch (error) {
+		console.error("Failed to resolve trusted origins:", error);
+		return [];
+	}
+};
+
+const rewriteToCanonicalOrigin = async (url: string): Promise<string> => {
+	try {
+		const configured = process.env.BETTER_AUTH_URL;
+		let origin: string | null = configured ?? null;
+		if (!origin) {
+			const settings = await getWebServerSettings();
+			origin = settings?.host
+				? `${settings.https ? "https" : "http"}://${settings.host}`
+				: settings?.serverIp
+					? `http://${settings.serverIp}:3000`
+					: null;
+		}
+		if (!origin) return url;
+		const target = new URL(url);
+		const canonical = new URL(origin);
+		target.protocol = canonical.protocol;
+		target.host = canonical.host;
+		return target.toString();
+	} catch {
+		return url;
+	}
+};
+
+const createBetterAuth = () =>
+	betterAuth({
+		database: drizzleAdapter(db, {
+			provider: "pg",
+			schema: schema,
+		}),
+		disabledPaths: [
+			"/sso/register",
+			"/organization/create",
+			"/organization/update",
+			"/organization/delete",
+			"/organization/update-member-role",
+			"/organization/invite-member",
+			"/api-key/create",
+			"/api-key/update",
+			"/scim/generate-token",
+			"/scim/list-provider-connections",
+			"/scim/get-provider-connection",
+			"/scim/delete-provider-connection",
+			...(!IS_CLOUD ? ["/verify-email"] : []),
+		],
+		secret: betterAuthSecret,
+		onAPIError: {
+			errorURL: "/",
+		},
+		...(!IS_CLOUD
+			? {
+					advanced: {
+						useSecureCookies: false,
+						defaultCookieAttributes: {
+							sameSite: "lax",
+							secure: false,
+							httpOnly: true,
+							path: "/",
+						},
+					},
+				}
+			: {}),
+
+		account: {
+			accountLinking: {
+				enabled: true,
+				async trustedProviders() {
+					const fromDb = await getTrustedProviders();
+					return ["github", "google", ...fromDb];
+				},
+				allowDifferentEmails: true,
+			},
+		},
+		appName: "Dokploy",
+		socialProviders: {
+			github: {
+				clientId: process.env.GITHUB_CLIENT_ID as string,
+				clientSecret: process.env.GITHUB_CLIENT_SECRET as string,
+			},
+			google: {
+				clientId: process.env.GOOGLE_CLIENT_ID as string,
+				clientSecret: process.env.GOOGLE_CLIENT_SECRET as string,
+			},
+		},
+		logger: {
+			disabled: process.env.NODE_ENV === "production",
+		},
+		trustedOrigins: resolveTrustedOrigins,
+		hooks: {
+			before: createAuthMiddleware(async (ctx) => {
+				ctx.context.trustedOrigins = [
+					...(ctx.context.baseURL ? [new URL(ctx.context.baseURL).origin] : []),
+					...(await resolveTrustedOrigins()),
+				].filter(Boolean);
+
+				if (ctx.path === "/admin/remove-user") {
+					throw new APIError("FORBIDDEN", {
+						message: "Use the account deletion flow to remove users",
+					});
+				}
+
+				if (ctx.path === "/admin/impersonate-user") {
+					const targetUserId = (ctx.body as { userId?: string } | undefined)
+						?.userId;
+					const target = targetUserId
+						? await db.query.user.findFirst({
+								where: eq(schema.user.id, targetUserId),
+								columns: { allowImpersonation: true },
+							})
+						: undefined;
+					if (!target?.allowImpersonation) {
+						throw new APIError("FORBIDDEN", {
+							message: "This user has not allowed impersonation",
+						});
+					}
+				}
+
+				if (ctx.path === "/two-factor/enable") {
+					const session = await getSessionFromCtx(ctx);
+					if (session && !session.user.twoFactorEnabled) {
+						await db
+							.update(schema.twoFactor)
+							.set({ verified: false })
+							.where(
+								and(
+									eq(schema.twoFactor.userId, session.user.id),
+									eq(schema.twoFactor.verified, true),
+								),
+							);
+					}
+				}
+
+				const isBlockedAuthPath =
+					ctx.path.startsWith("/sign-in/email") ||
+					ctx.path.startsWith("/sign-in/social") ||
+					ctx.path.startsWith("/sign-in/passkey") ||
+					ctx.path.startsWith("/sign-up/email") ||
+					ctx.path.startsWith("/passkey/verify-authentication") ||
+					ctx.path.startsWith("/passkey/generate-authenticate-options");
+
+				if (!IS_CLOUD && isBlockedAuthPath) {
+					const settings = await getWebServerSettings();
+					if (settings?.enforceSSO) {
+						throw new APIError("FORBIDDEN", {
+							message:
+								"SSO is enforced. Direct password, social, and passkey sign-in are disabled.",
+						});
+					}
+				}
+			}),
+		},
+		emailVerification: {
+			sendOnSignUp: true,
+			autoSignInAfterVerification: true,
+			sendOnSignIn: true,
+			sendVerificationEmail: async ({ user, url }) => {
+				if (IS_CLOUD) {
+					await sendVerificationEmail({
+						userName: user.name || "User",
+						email: user.email,
+						verificationUrl: await rewriteToCanonicalOrigin(url),
+					});
+				}
+			},
+		},
+		emailAndPassword: {
+			enabled: true,
+			autoSignIn: !IS_CLOUD,
+			requireEmailVerification:
+				IS_CLOUD && process.env.NODE_ENV === "production",
+			password: {
+				async hash(password) {
+					return bcrypt.hashSync(password, 10);
+				},
+				async verify({ hash, password }) {
+					return bcrypt.compareSync(password, hash);
+				},
+			},
+			sendResetPassword: async ({ user, url }) => {
+				const safeUrl = await rewriteToCanonicalOrigin(url);
+				await sendEmail({
+					email: user.email,
+					subject: "Reset your password",
+					text: `
+				<p>Click the link to reset your password: <a href="${safeUrl}">Reset Password</a></p>
+				`,
+				});
+			},
+		},
+		databaseHooks: {
+			user: {
+				create: {
+					before: async (_user, context) => {
+						if (context?.path.includes("/scim")) {
+							return { data: { emailVerified: true } };
+						}
+						if (!IS_CLOUD) {
+							const xDokployToken =
+								context?.request?.headers?.get("x-dokploy-token");
+							if (xDokployToken) {
+								let invitation: Awaited<ReturnType<typeof getUserByToken>>;
+								try {
+									invitation = await getUserByToken(xDokployToken);
+								} catch {
+									throw new APIError("BAD_REQUEST", {
+										message: "Invalid invitation token",
+									});
+								}
+								if (invitation.isExpired) {
+									throw new APIError("BAD_REQUEST", {
+										message: "Invitation has expired",
+									});
+								}
+								if (invitation.status !== "pending") {
+									throw new APIError("BAD_REQUEST", {
+										message: "Invitation has already been used",
+									});
+								}
+								if (
+									_user.email.toLowerCase().trim() !==
+									invitation.email.toLowerCase().trim()
+								) {
+									throw new APIError("BAD_REQUEST", {
+										message: "Email does not match invitation",
+									});
+								}
+							} else {
+								const isSSORequest = context?.path.includes("/sso");
+								if (isSSORequest) {
+									return;
+								}
+								const isAdminPresent = await db.query.member.findFirst({
+									where: eq(schema.member.role, "owner"),
+								});
+								if (isAdminPresent) {
+									throw new APIError("BAD_REQUEST", {
+										message: "Admin is already created",
+									});
+								}
+							}
+						}
+					},
+					after: async (user, context) => {
+						const isSSORequest = context?.path.includes("/sso");
+						const isSCIMRequest = context?.path.includes("/scim");
+						const isAdminPresent = await db.query.member.findFirst({
+							where: eq(schema.member.role, "owner"),
+						});
+
+						if (!IS_CLOUD && !isAdminPresent) {
+							await updateWebServerSettings({
+								serverIp: await getPublicIpWithFallback(),
+							});
+						}
+
+						if (IS_CLOUD) {
+							try {
+								const hutk = getHubSpotUTK(
+									context?.request?.headers?.get("cookie") || undefined,
+								);
+								// Cast to include additional fields
+								const userWithFields = user as typeof user & {
+									lastName?: string;
+								};
+								const hubspotSuccess = await submitToHubSpot(
+									{
+										email: user.email,
+										firstName: user.name || "", // name is mapped to firstName column
+										lastName: userWithFields.lastName || "",
+									},
+									hutk,
+								);
+								if (!hubspotSuccess) {
+									console.error("Failed to submit to HubSpot");
+								}
+							} catch (error) {
+								console.error("Error submitting to HubSpot", error);
+							}
+						}
+
+						if (isSCIMRequest) {
+							const membership = await db.query.member.findFirst({
+								where: eq(schema.member.userId, user.id),
+							});
+							if (membership) {
+								const defaultRole = await resolveOrganizationDefaultRole(
+									membership.organizationId,
+								);
+								if (defaultRole !== membership.role) {
+									await db
+										.update(schema.member)
+										.set({ role: defaultRole })
+										.where(eq(schema.member.id, membership.id));
+								}
+							}
+							return;
+						}
+
+						if (IS_CLOUD || !isAdminPresent) {
+							const createdOrganization = await db.transaction(async (tx) => {
+								const organization = await tx
+									.insert(schema.organization)
+									.values({
+										name: "My Organization",
+										ownerId: user.id,
+										createdAt: new Date(),
+									})
+									.returning()
+									.then((res) => res[0]);
+
+								await tx.insert(schema.member).values({
+									userId: user.id,
+									organizationId: organization?.id || "",
+									role: "owner",
+									createdAt: new Date(),
+									isDefault: true, // Mark first organization as default
+								});
+
+								return organization;
+							});
+
+							if (IS_CLOUD) {
+								void captureEvent({
+									distinctId: user.id,
+									event: "user_signed_up",
+									organizationId: createdOrganization?.id,
+									sessionId: getPostHogSessionId(context?.request?.headers),
+									properties: {
+										method: context?.path,
+										$set: { email: user.email, name: user.name },
+										$set_once: { signed_up_at: new Date().toISOString() },
+									},
+								});
+							}
+						} else if (isSSORequest) {
+							const providerId = context?.params?.providerId;
+							if (!providerId) {
+								throw new APIError("BAD_REQUEST", {
+									message: "Provider ID is required",
+								});
+							}
+							const provider = await db.query.ssoProvider.findFirst({
+								where: eq(schema.ssoProvider.providerId, providerId),
+							});
+
+							if (!provider) {
+								throw new APIError("BAD_REQUEST", {
+									message: "Provider not found",
+								});
+							}
+							const defaultRole = provider.organizationId
+								? await resolveOrganizationDefaultRole(provider.organizationId)
+								: "member";
+							await db.insert(schema.member).values({
+								userId: user.id,
+								organizationId: provider?.organizationId || "",
+								role: defaultRole,
+								createdAt: new Date(),
+								isDefault: true,
+							});
+						}
+					},
+				},
+			},
+			session: {
+				create: {
+					before: async (session) => {
+						// Find the default organization for this user
+						// Priority: 1) isDefault=true, 2) most recently created
+						const member = await db.query.member.findFirst({
+							where: eq(schema.member.userId, session.userId),
+							orderBy: [
+								desc(schema.member.isDefault),
+								desc(schema.member.createdAt),
+							],
+							with: {
+								organization: true,
+							},
+						});
+
+						return {
+							data: {
+								...session,
+								activeOrganizationId: member?.organization.id,
+							},
+						};
+					},
+					after: async (session) => {
+						const orgId = (
+							session as typeof session & { activeOrganizationId?: string }
+						).activeOrganizationId;
+						if (!orgId) return;
+						const memberRecord = await db.query.member.findFirst({
+							where: and(
+								eq(schema.member.userId, session.userId),
+								eq(schema.member.organizationId, orgId),
+							),
+							with: { user: true },
+						});
+						if (!memberRecord) return;
+						await createAuditLog({
+							organizationId: orgId,
+							userId: session.userId,
+							userEmail: memberRecord.user.email,
+							userRole: memberRecord.role,
+							action: "login",
+							resourceType: "session",
+						});
+					},
+				},
+				delete: {
+					after: async (session) => {
+						const orgId = (
+							session as typeof session & { activeOrganizationId?: string }
+						).activeOrganizationId;
+						if (!orgId) return;
+						const memberRecord = await db.query.member.findFirst({
+							where: and(
+								eq(schema.member.userId, session.userId),
+								eq(schema.member.organizationId, orgId),
+							),
+							with: { user: true },
+						});
+						if (!memberRecord) return;
+						await createAuditLog({
+							organizationId: orgId,
+							userId: session.userId,
+							userEmail: memberRecord.user.email,
+							userRole: memberRecord.role,
+							action: "logout",
+							resourceType: "session",
+						});
+					},
+				},
+			},
+		},
+		session: {
+			expiresIn: 60 * 60 * 24 * 3,
+			updateAge: 60 * 60 * 24,
+		},
+		user: {
+			modelName: "user",
+			fields: {
+				name: "firstName", // Map better-auth's default 'name' field to 'firstName' column
+			},
+			additionalFields: {
+				role: {
+					type: "string",
+					// required: true,
+					input: false,
+				},
+				ownerId: {
+					type: "string",
+					// required: true,
+					input: false,
+				},
+				allowImpersonation: {
+					fieldName: "allowImpersonation",
+					type: "boolean",
+					defaultValue: false,
+				},
+				lastName: {
+					type: "string",
+					required: false,
+					input: true,
+					defaultValue: "",
+				},
+				enableEnterpriseFeatures: {
+					type: "boolean",
+					required: false,
+					input: false,
+				},
+				isValidEnterpriseLicense: {
+					type: "boolean",
+					required: false,
+					input: false,
+				},
+			},
+		},
+		plugins: [
+			apiKey({
+				enableMetadata: true,
+				references: "user",
+			}),
+			sso({ trustEmailVerified: true }),
+			scim({
+				beforeSCIMTokenGenerated: async ({ user }) => {
+					const dbUser = await db.query.user.findFirst({
+						where: eq(schema.user.id, user.id),
+						columns: { enableEnterpriseFeatures: true },
+					});
+
+					if (!dbUser?.enableEnterpriseFeatures) {
+						throw new APIError("FORBIDDEN", {
+							message: "SCIM provisioning requires an enterprise license",
+						});
+					}
+				},
+			}),
+			twoFactor(),
+			passkey(),
+			organization({
+				ac,
+				roles: {
+					owner: ownerRole,
+					admin: adminRole,
+					member: memberRole,
+				},
+				dynamicAccessControl: {
+					enabled: true,
+					maximumRolesPerOrganization: 10,
+				},
+			}),
+			admin(
+				IS_CLOUD
+					? {
+							adminUserIds: getRootAdminIds(),
+							roles: {},
+						}
+					: { adminRoles: [] },
+			),
+		],
+	});
+
+const globalForAuth = globalThis as unknown as {
+	betterAuthInstance?: ReturnType<typeof createBetterAuth>;
+};
+
+if (!globalForAuth.betterAuthInstance) {
+	globalForAuth.betterAuthInstance = createBetterAuth();
+}
+
+const { handler, api } = globalForAuth.betterAuthInstance;
+
+const _auth = {
+	handler,
+	createApiKey: api.createApiKey,
+	registerSSOProvider: api.registerSSOProvider,
+	updateSSOProvider: api.updateSSOProvider,
+	generateSCIMToken: api.generateSCIMToken,
+	listSCIMProviderConnections: api.listSCIMProviderConnections,
+	deleteSCIMProviderConnection: api.deleteSCIMProviderConnection,
+};
+
+export type AuthType = typeof _auth;
+export const auth: AuthType = _auth;
+
+// The OpenAPI handler and the tRPC context both validate the same request;
+// without this an API key's usage counters would be consumed twice per call.
+const validatedRequests = new WeakMap<
+	IncomingMessage,
+	ReturnType<typeof resolveRequest>
+>();
+
+export const validateRequest = (request: IncomingMessage) => {
+	let result = validatedRequests.get(request);
+	if (!result) {
+		result = resolveRequest(request);
+		validatedRequests.set(request, result);
+	}
+	return result;
+};
+
+const resolveRequest = async (request: IncomingMessage) => {
+	const apiKey = request.headers["x-api-key"] as string;
+	if (apiKey) {
+		try {
+			const { valid, key, error } = await api.verifyApiKey({
+				body: {
+					key: apiKey,
+				},
+			});
+
+			if (error?.code === "RATE_LIMITED" || error?.code === "USAGE_EXCEEDED") {
+				const tryAgainIn = (error as { details?: { tryAgainIn?: number } })
+					.details?.tryAgainIn;
+				return {
+					session: null,
+					user: null,
+					rateLimited: {
+						retryAfterSeconds: tryAgainIn ? Math.ceil(tryAgainIn / 1000) : null,
+					},
+				};
+			}
+
+			if (error) {
+				throw new Error(error.message?.toString() || "Error verifying API key");
+			}
+			if (!valid || !key) {
+				return {
+					session: null,
+					user: null,
+				};
+			}
+
+			const apiKeyRecord = await db.query.apikey.findFirst({
+				where: eq(schema.apikey.id, key.id),
+				with: {
+					user: true,
+				},
+			});
+
+			if (!apiKeyRecord) {
+				return {
+					session: null,
+					user: null,
+				};
+			}
+
+			const organizationId = (
+				JSON.parse(apiKeyRecord.metadata || "{}") as {
+					organizationId?: string;
+				}
+			).organizationId;
+
+			if (!organizationId) {
+				return {
+					session: null,
+					user: null,
+				};
+			}
+
+			const member = await db.query.member.findFirst({
+				where: and(
+					eq(schema.member.userId, apiKeyRecord.user.id),
+					eq(schema.member.organizationId, organizationId),
+				),
+				with: {
+					organization: true,
+				},
+			});
+
+			if (!member) {
+				return {
+					session: null,
+					user: null,
+				};
+			}
+
+			// When accessing from DB, use actual column names
+			const userFromDb = apiKeyRecord.user as typeof apiKeyRecord.user & {
+				firstName: string;
+				lastName: string;
+			};
+
+			const mockSession = {
+				session: {
+					userId: apiKeyRecord.user.id,
+					activeOrganizationId: organizationId || "",
+				},
+				user: {
+					id: userFromDb.id,
+					name: userFromDb.firstName, // Map firstName back to name for better-auth
+					email: userFromDb.email,
+					emailVerified: userFromDb.emailVerified,
+					image: userFromDb.image,
+					createdAt: userFromDb.createdAt,
+					updatedAt: userFromDb.updatedAt,
+					twoFactorEnabled: userFromDb.twoFactorEnabled,
+					role: member?.role || "member",
+					ownerId: member?.organization.ownerId || apiKeyRecord.user.id,
+					enableEnterpriseFeatures: userFromDb.enableEnterpriseFeatures,
+					isValidEnterpriseLicense: userFromDb.isValidEnterpriseLicense,
+				},
+			};
+
+			return mockSession;
+		} catch (error) {
+			console.error("Error verifying API key", error);
+			return {
+				session: null,
+				user: null,
+			};
+		}
+	}
+
+	// If no API key, proceed with normal session validation
+	const session = await api.getSession({
+		headers: new Headers({
+			cookie: request.headers.cookie || "",
+		}),
+	});
+
+	if (!session?.session || !session.user) {
+		return {
+			session: null,
+			user: null,
+		};
+	}
+
+	if (session?.user) {
+		const member = await db.query.member.findFirst({
+			where: and(
+				eq(schema.member.userId, session.user.id),
+				...(session.session.activeOrganizationId
+					? [
+							eq(
+								schema.member.organizationId,
+								session.session.activeOrganizationId || "",
+							),
+						]
+					: []),
+			),
+			orderBy: [desc(schema.member.isDefault), desc(schema.member.createdAt)],
+			with: {
+				organization: true,
+				user: true,
+			},
+		});
+
+		session.user.role = member?.role || "member";
+		session.user.enableEnterpriseFeatures =
+			member?.user.enableEnterpriseFeatures || false;
+		session.user.isValidEnterpriseLicense =
+			member?.user.isValidEnterpriseLicense || false;
+		session.session.activeOrganizationId = member?.organization.id || "";
+		if (member) {
+			session.user.ownerId = member.organization.ownerId;
+		} else {
+			session.user.ownerId = session.user.id;
+		}
+	}
+
+	return session;
+};
